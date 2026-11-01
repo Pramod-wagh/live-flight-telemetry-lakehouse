@@ -1,0 +1,19 @@
+# Environment & Secrets
+.env
+.env.local
+
+# Airflow & Runtime Logs
+logs/
+*.log
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

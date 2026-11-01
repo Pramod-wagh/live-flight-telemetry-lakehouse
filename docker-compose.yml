@@ -1,0 +1,151 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: ${AIRFLOW_IMAGE_NAME:-flight-airflow-pyspark:latest}
+  environment:
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqJZPo=
+    - AIRFLOW__WEBSERVER__SECRET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqJZPo=
+    - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8085
+    - AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX=True
+    - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+    - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+    - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+    - MINIO_RAW_BUCKET=${MINIO_RAW_BUCKET}
+    - MINIO_ICEBERG_BUCKET=${MINIO_ICEBERG_BUCKET}
+    - SPARK_CONF_DIR=/opt/spark/conf
+    - PYTHONPATH=/opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./spark/apps:/opt/spark-apps
+    - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_started
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. PostgreSQL (Airflow Metadata + Iceberg JDBC Catalog + Power BI Serving Layer)
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: flight-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432" # Exposed to Windows host for Power BI Desktop & pgAdmin
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data-pipeline-net
+
+  # ----------------------------------------------------------------------------
+  # 2. MinIO (S3 Object Storage for Data Lake & Iceberg Warehouse)
+  # ----------------------------------------------------------------------------
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: flight-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-adminpassword123}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-pipeline-net
+
+  # ----------------------------------------------------------------------------
+  # 3. Apache Spark Cluster (Official Apache Spark 3.5.1 Master + Worker)
+  # ----------------------------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: flight-spark-master
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "7077:7077"
+      - "8082:8080" # Spark Master Web UI
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    networks:
+      - data-pipeline-net
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: flight-spark-worker
+    depends_on:
+      - spark-master
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2G
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    networks:
+      - data-pipeline-net
+
+  # ----------------------------------------------------------------------------
+  # 4. Apache Airflow (Orchestration Engine + Lakehouse Bootstrapper)
+  # ----------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: flight-airflow-init
+    environment:
+      - AIRFLOW_ADMIN_USERNAME=${AIRFLOW_ADMIN_USERNAME:-admin}
+      - AIRFLOW_ADMIN_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin}
+      - AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+    entrypoint: ["/bin/bash", "/opt/airflow/scripts/airflow-init.sh"]
+    networks:
+      - data-pipeline-net
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: flight-airflow-webserver
+    restart: always
+    command: webserver
+    ports:
+      - "8085:8080" # Airflow UI accessible at http://localhost:8085
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-pipeline-net
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: flight-airflow-scheduler
+    restart: always
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-pipeline-net
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  data-pipeline-net:
+    driver: bridge
